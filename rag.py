@@ -98,6 +98,67 @@ def _resolve_path(data: dict, path: str) -> Any | None:
     return current
 
 
+def _summarise_advisories(advisories: Any) -> dict:
+    """Replace a raw advisory list with a compact statistical summary.
+
+    Dumping full CVE descriptions into the context causes every agent to
+    discuss security at length regardless of its assigned persona, drowning
+    out governance/maturity signals.  A counts-plus-severity summary gives
+    agents the signal they need without flooding the token budget.
+
+    Returns a dict like::
+
+        {
+          "total": 7,
+          "by_severity": {"HIGH": 3, "MEDIUM": 2, "LOW": 2},
+          "has_patches": true,
+          "types": ["RCE", "XSS"]
+        }
+    """
+    if not isinstance(advisories, list) or not advisories:
+        return {"total": 0}
+
+    severity_counts: dict[str, int] = {}
+    has_patches = False
+    vuln_types: list[str] = []
+
+    for adv in advisories:
+        if not isinstance(adv, dict):
+            continue
+        sev = str(adv.get("severity") or adv.get("cvss", {}).get("vectorString") or "UNKNOWN").upper()
+        # Normalise to broad buckets
+        if any(s in sev for s in ("CRITICAL",)):
+            sev = "CRITICAL"
+        elif any(s in sev for s in ("HIGH",)):
+            sev = "HIGH"
+        elif any(s in sev for s in ("MODERATE", "MEDIUM")):
+            sev = "MEDIUM"
+        elif any(s in sev for s in ("LOW",)):
+            sev = "LOW"
+        else:
+            sev = "UNKNOWN"
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+        # Any patched version present?
+        if adv.get("patchedVersions") or adv.get("firstPatchedVersion"):
+            has_patches = True
+
+        # Collect short vulnerability type labels (CWE name / summary first sentence)
+        summary = adv.get("summary") or adv.get("description") or ""
+        if summary:
+            first_sentence = summary.split(".")[0].strip()[:60]
+            if first_sentence and first_sentence not in vuln_types:
+                vuln_types.append(first_sentence)
+
+    return {
+        "total": len(advisories),
+        "by_severity": severity_counts,
+        "has_patches": has_patches,
+        # Keep only up to 5 type labels to avoid re-flooding the context
+        "types": vuln_types[:5],
+    }
+
+
 def _compact_json(obj: Any, max_depth: int = 6, _depth: int = 0) -> Any:
     """Return a depth-limited, compacted version of *obj*."""
     if _depth >= max_depth:
@@ -148,6 +209,11 @@ def retrieve_context(repo_data: dict, metric: MetricDefinition) -> str:
     Returns a JSON string containing:
       1. A compact repo summary (always included).
       2. The relevant sections indicated by ``metric.data_keys``.
+
+    Advisory data is intentionally replaced with a compact statistical
+    summary (total count + severity breakdown) rather than raw CVE text, to
+    prevent security language from drowning out governance/maturity signals
+    when those advisories happen to be present.
     """
     sections: dict[str, Any] = {}
     for key in metric.data_keys:
@@ -155,6 +221,10 @@ def retrieve_context(repo_data: dict, metric: MetricDefinition) -> str:
         for path in paths:
             resolved = _resolve_path(repo_data, path)
             if resolved is not None:
+                # Replace raw advisory lists with a compact summary so they
+                # don't flood the context and bias all agents toward security.
+                if path == "repository.advisories" and isinstance(resolved, list):
+                    resolved = _summarise_advisories(resolved)
                 sections[path] = resolved
 
     compacted = _compact_json(sections)

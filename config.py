@@ -235,10 +235,18 @@ DEFAULT_METRICS: list[MetricDefinition] = [
         display_name="Project Maturity",
         description="Overall maturity of the project considering governance, processes, and community.",
         prompt=(
-            "Evaluate the overall maturity of this open-source project. Consider "
-            "repository age, issues and releases, governance (code of conduct, contributing guide, templates), community "
-            "size, dependency footprint, security policy, funding, release history, and archival status."
-            "Give a score from {min} to {max} where {min} is very immature "
+            "Evaluate the overall maturity of this open-source project. "
+            "Score holistically across ALL of the following dimensions — "
+            "no single dimension should dominate:\n"
+            "  • Governance: code of conduct, contributing guide, issue/PR templates\n"
+            "  • Community: contributor count, bus-factor, PR activity, issue responsiveness\n"
+            "  • Release & versioning: release history, cadence, tagging\n"
+            "  • Documentation: README quality, external docs, changelogs\n"
+            "  • CI/CD & automation: automated tests, build pipelines\n"
+            "  • Security posture: security policy presence, advisory count/severity, "
+            "patch responsiveness — treat this as ONE of the six dimensions above, "
+            "not a veto over the others\n\n"
+            "Give a score from {min} to {max} in increments of 0.1 where {min} is very immature "
             "and {max} is a fully mature project."
         ),
         pipeline="debate",
