@@ -6,8 +6,22 @@ Two sub-graphs, selected per metric by the ``pipeline`` field:
   * **single** – one LLM call produces the score directly.
   * **debate** – N configurable agents take turns for K rounds → synthesizer.
 
-The top-level graph fans-out across all requested metrics, collects results,
-and returns a list of ``MetricResult``.
+The top-level graph uses LangGraph's Send API to fan-out across all requested
+metrics in parallel.  Each metric runs in its own sub-graph whose internal
+debate loop is also modelled as a proper LangGraph conditional-edge cycle.
+
+Graph topology
+──────────────
+Top-level:
+  START → fan_out → [per-metric sub-graph via Send] → collect_results → END
+
+Single sub-graph (per metric):
+  START → run_single → END
+
+Debate sub-graph (per metric):
+  START → agent_turn → should_synthesize?
+                          ├─ "continue" → agent_turn   (round-robin loop)
+                          └─ "synthesize" → synthesize → END
 """
 
 from __future__ import annotations
@@ -16,9 +30,10 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
-from langgraph.graph import END, StateGraph
+from langgraph.constants import Send
+from langgraph.graph import END, START, StateGraph
 
 from agents import (
     SINGLE_AGENT_SYSTEM,
@@ -41,17 +56,54 @@ class MetricResult(TypedDict, total=False):
     debate_log: list[dict[str, str]]
 
 
+def _merge_results(left: list[MetricResult], right: list[MetricResult]) -> list[MetricResult]:
+    """Reducer: accumulate per-metric results sent back from parallel sub-graphs."""
+    return left + right
+
+
 class PipelineState(TypedDict, total=False):
     """Top-level state shared across the full graph."""
     repo_data: dict[str, Any]
     metrics: list[MetricDefinition]
-    results: list[MetricResult]
+    results: Annotated[list[MetricResult], _merge_results]
     llm_model: str
     llm_host: str
     # Provenance – used to name saved debate logs
     repo_slug: str          # e.g. "lorabridge/lorabridge"
     snapshot_timestamp: float | None  # crawl timestamp, or None for local files
     log_dir: str            # directory where debate logs are written
+
+
+# ── Single-metric state (used inside per-metric sub-graphs) ────────────────
+
+class SingleMetricState(TypedDict, total=False):
+    """Scoped state for evaluating one metric."""
+    metric: MetricDefinition
+    repo_data: dict[str, Any]
+    llm_model: str
+    llm_host: str
+    repo_slug: str
+    snapshot_timestamp: float | None
+    log_dir: str
+    result: MetricResult
+
+
+# ── Debate state (used inside the debate sub-graph loop) ──────────────────
+
+class DebateState(TypedDict, total=False):
+    """Scoped state for one debate run."""
+    metric: MetricDefinition
+    repo_data: dict[str, Any]
+    llm_model: str
+    llm_host: str
+    repo_slug: str
+    snapshot_timestamp: float | None
+    log_dir: str
+    # Debate runtime
+    debate_log: list[dict[str, str]]
+    current_round: int       # 0-based round index
+    current_agent_idx: int   # index into metric.get_debate_agents()
+    result: MetricResult
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -67,27 +119,22 @@ def _parse_json_response(text: str) -> dict[str, Any]:
       3. First ``{…}`` block found anywhere in the text.
       4. Numeric fallback: scan prose for an explicit score mention.
     """
-    # 1. Direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # 2. Markdown fenced block
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    # 3. First bare { … }
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(0))
         except json.JSONDecodeError:
             pass
-    # 4. Numeric prose fallback — look for patterns like "score: 7", "a 7/10",
-    #    "I'd give this a 7", "rating of 7", "7 out of 10"
     score_match = re.search(
         r"(?:score|rating|metric|give(?:\s+this)?(?:\s+a)?|rank)\D{0,10}(\d+(?:\.\d+)?)"
         r"|(\d+(?:\.\d+)?)\s*/\s*10"
@@ -123,54 +170,8 @@ def _build_scoring_user_prompt(metric: MetricDefinition, context: str) -> str:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Single-agent sub-graph
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _run_single(
-    metric: MetricDefinition,
-    repo_data: dict,
-    model: str,
-    llm_host: str,
-) -> MetricResult:
-    context = retrieve_context(repo_data, metric)
-    user_msg = _build_scoring_user_prompt(metric, context)  # strict JSON reminder
-    messages = [
-        {"role": "system", "content": SINGLE_AGENT_SYSTEM},
-        {"role": "user", "content": user_msg},
-    ]
-    reply = call_llm(messages, model=model, llm_host=llm_host)
-    parsed = _parse_json_response(reply)
-    return MetricResult(
-        name=metric.name,
-        display_name=metric.display_name,
-        metric=parsed.get("metric"),
-        explanation=parsed.get("explanation", ""),
-        pipeline="single",
-        debate_log=[],
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Multi-agent debate sub-graph (generic N-agent round-robin)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _format_transcript(debate_log: list[dict[str, str]]) -> str:
-    """Render the debate log into a readable transcript string."""
-    return "\n\n".join(
-        f"[{entry['role'].upper()}]:\n{entry['content']}" for entry in debate_log
-    )
-
-
 def _extract_stated_score(text: str) -> float | None:
-    """Pull the *last* explicit score mention from an agent turn.
-
-    Searching from the end of the text reduces the risk of picking up a
-    score mentioned in passing (e.g. quoting a peer) rather than the
-    agent's own current estimate, which is typically stated at the end.
-
-    Returns the numeric value, or None if nothing was found.
-    """
+    """Pull the *last* explicit score mention from an agent turn."""
     matches = re.findall(
         r"(?:current estimate|my estimate|i.{0,8}give|i.{0,8}rate|i.{0,8}score|score|rating|estimate)"
         r"[^\d]{0,15}(\d+(?:\.\d+)?)"
@@ -178,7 +179,6 @@ def _extract_stated_score(text: str) -> float | None:
         text,
         re.IGNORECASE,
     )
-    # Walk matches in reverse to find the agent's final stated estimate
     for prose_val, slash_val in reversed(matches):
         raw = prose_val or slash_val
         if raw:
@@ -193,18 +193,11 @@ def _extract_peer_summaries(
 ) -> str:
     """Return a short bullet-point summary of each OTHER agent's most recent turn.
 
-    Each bullet contains only a brief prose snippet (≤300 chars) of the
-    agent's reasoning.  Score estimates are intentionally OMITTED here to
-    prevent social-contagion cascades; numeric anchoring is handled solely
-    by the Python-computed median injected into the synthesizer prompt.
-
-    We deliberately do NOT pass the full transcript to discussion agents so
-    that hallucinations from earlier turns cannot compound.  Only the
-    synthesizer receives the complete transcript.
+    Score estimates are intentionally omitted to prevent social-contagion
+    cascades.  Only the synthesizer receives the complete transcript.
     """
     name_to_display = {a.name: a.display_name for a in agents}
 
-    # Keep only the most recent entry per peer agent
     latest: dict[str, str] = {}
     for entry in debate_log:
         role = entry["role"]
@@ -217,7 +210,6 @@ def _extract_peer_summaries(
     lines = ["── Key points from other participants (most recent turn, no scores shown) ──"]
     for role, content in latest.items():
         display = name_to_display.get(role, role)
-        # Strip any score lines at the tail to avoid implicit anchoring
         stripped = re.sub(
             r"(?:my current estimate|current estimate|score estimate)[^\n]{0,60}",
             "",
@@ -235,15 +227,7 @@ def _compute_transcript_median(
     debate_log: list[dict[str, str]],
     scale: tuple[int, int],
 ) -> float | None:
-    """Collect each non-synthesizer agent's *last* stated score per turn and
-    return the median.
-
-    Using the last score per turn (via ``_extract_stated_score`` which searches
-    from the tail) means we capture the agent's final estimate for that round
-    rather than a score mentioned in passing while quoting a peer.
-
-    Returns None if no valid scores were found.
-    """
+    """Collect each non-synthesizer agent's last stated score and return the median."""
     lo, hi = scale
     all_scores: list[float] = []
     for entry in debate_log:
@@ -261,78 +245,160 @@ def _compute_transcript_median(
     return all_scores[mid] if n % 2 else (all_scores[mid - 1] + all_scores[mid]) / 2
 
 
-def _run_debate(
+def _save_debate_log(
+    debate_log: list[dict[str, str]],
     metric: MetricDefinition,
-    repo_data: dict,
-    model: str,
-    llm_host: str,
-) -> MetricResult:
-    """Run a configurable multi-agent debate.
+    result: MetricResult,
+    repo_slug: str,
+    snapshot_timestamp: float | None,
+    log_dir: str,
+) -> str:
+    """Write *debate_log* to a JSON file and return the path."""
+    os.makedirs(log_dir, exist_ok=True)
+    ts = int(snapshot_timestamp) if snapshot_timestamp is not None else int(
+        datetime.now(timezone.utc).timestamp()
+    )
+    slug_safe = repo_slug.replace("/", "_")
+    filename = f"{metric.name}_{slug_safe}_{ts}.json"
+    path = os.path.join(log_dir, filename)
 
-    Each agent takes turns in round-robin order for ``metric.debate_rounds``
-    full rounds.  On follow-up turns an agent sees only a short bullet summary
-    of the *other* agents' most recent positions — NOT the full transcript —
-    to prevent hallucination compounding.  The synthesizer alone receives the
-    complete transcript.
+    median_score = _compute_transcript_median(debate_log, metric.scale)
+    payload = {
+        "metric": metric.name,
+        "display_name": metric.display_name,
+        "repo": repo_slug,
+        "snapshot_timestamp": snapshot_timestamp,
+        "agents": [a.name for a in metric.get_debate_agents()],
+        "debate_rounds": metric.debate_rounds,
+        "final_score": result.get("metric"),
+        "transcript_median": median_score,
+        "log": debate_log,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return path
 
-    Each agent's identity is embedded in the system prompt wrapper produced by
-    ``_agent_system_prompt()`` so the model cannot misattribute its own role.
-    """
-    agents: list[DebateAgent] = metric.get_debate_agents()
-    context = retrieve_context(repo_data, metric)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Single sub-graph
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _single_node(state: SingleMetricState) -> dict:
+    """One-shot LLM call that scores the metric and stores the result."""
+    metric = state["metric"]
+    context = retrieve_context(state["repo_data"], metric)
+    user_msg = _build_scoring_user_prompt(metric, context)
+    messages = [
+        {"role": "system", "content": SINGLE_AGENT_SYSTEM},
+        {"role": "user", "content": user_msg},
+    ]
+    reply = call_llm(messages, model=state["llm_model"], llm_host=state["llm_host"])
+    parsed = _parse_json_response(reply)
+    return {
+        "result": MetricResult(
+            name=metric.name,
+            display_name=metric.display_name,
+            metric=parsed.get("metric"),
+            explanation=parsed.get("explanation", ""),
+            pipeline="single",
+            debate_log=[],
+        )
+    }
+
+
+def _build_single_graph() -> Any:
+    g = StateGraph(SingleMetricState)
+    g.add_node("run_single", _single_node)
+    g.add_edge(START, "run_single")
+    g.add_edge("run_single", END)
+    return g.compile()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Debate sub-graph  —  proper LangGraph conditional-edge loop
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _agent_turn_node(state: DebateState) -> dict:
+    """One agent speaks; advance the round-robin cursors."""
+    metric: MetricDefinition = state["metric"]
+    agents = metric.get_debate_agents()
+    agent_idx = state.get("current_agent_idx", 0)
+    round_idx = state.get("current_round", 0)
+    debate_log: list[dict[str, str]] = state.get("debate_log", [])
+
+    agent = agents[agent_idx]
+    context = retrieve_context(state["repo_data"], metric)
     base_user_msg = _build_user_prompt(metric, context)
-    debate_log: list[dict[str, str]] = []
+    round_label = f"Round {round_idx + 1} of {metric.debate_rounds}"
 
+    if not debate_log:
+        agent_user_content = (
+            f"[{round_label}]\n\n"
+            f"{base_user_msg}\n\n"
+            "Analyse the repository data above from your perspective and "
+            "give your initial score estimate with reasoning. "
+            "Do NOT invent any data — only cite what is present above. "
+            "State your current score estimate as a plain number at the "
+            "very end of your message, e.g. 'My current estimate: 6/10'."
+        )
+    else:
+        peer_summary = _extract_peer_summaries(debate_log, agent.name, agents)
+        agent_user_content = (
+            f"[{round_label}]\n\n"
+            f"{base_user_msg}\n\n"
+            f"{peer_summary}\n\n"
+            "Respond to any peer points that cite real repository data, "
+            "and update your score estimate ONLY if new evidence from "
+            "the repository data warrants it. "
+            "Do NOT copy or mirror another agent's score — anchor yours "
+            "to the specific evidence you cite. "
+            "Do NOT invent any data. "
+            "State your current score estimate as a plain number at the "
+            "very end of your message, e.g. 'My current estimate: 6/10'."
+        )
+
+    system = (
+        f"You are the {agent.display_name} in a structured evaluation panel.\n\n"
+        + agent.system_prompt
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": agent_user_content},
+    ]
+    reply = call_llm(
+        messages,
+        model=state["llm_model"],
+        llm_host=state["llm_host"],
+        max_tokens=800,
+    )
+
+    new_log = debate_log + [{"role": agent.name, "content": reply}]
+
+    # Advance cursors
+    next_agent_idx = agent_idx + 1
+    next_round = round_idx
+    if next_agent_idx >= len(agents):
+        next_agent_idx = 0
+        next_round = round_idx + 1
+
+    return {
+        "debate_log": new_log,
+        "current_agent_idx": next_agent_idx,
+        "current_round": next_round,
+    }
+
+
+def _synthesize_node(state: DebateState) -> dict:
+    """Read the full debate transcript and produce the final JSON score."""
+    metric: MetricDefinition = state["metric"]
+    debate_log: list[dict[str, str]] = state["debate_log"]
+    agents = metric.get_debate_agents()
+
+    transcript = "\n\n".join(
+        f"[{e['role'].upper()}]:\n{e['content']}" for e in debate_log
+    )
     agent_names = ", ".join(a.display_name for a in agents)
 
-    for round_idx in range(metric.debate_rounds):
-        for agent in agents:
-            round_label = f"Round {round_idx + 1} of {metric.debate_rounds}"
-
-            if not debate_log:
-                # First turn — repository data only; no prior discussion yet
-                agent_user_content = (
-                    f"[{round_label}]\n\n"
-                    f"{base_user_msg}\n\n"
-                    "Analyse the repository data above from your perspective and "
-                    "give your initial score estimate with reasoning. "
-                    "Do NOT invent any data — only cite what is present above. "
-                    "State your current score estimate as a plain number at the "
-                    "very end of your message, e.g. 'My current estimate: 6/10'."
-                )
-            else:
-                peer_summary = _extract_peer_summaries(debate_log, agent.name, agents)
-                agent_user_content = (
-                    f"[{round_label}]\n\n"
-                    f"{base_user_msg}\n\n"
-                    f"{peer_summary}\n\n"
-                    "Respond to any peer points that cite real repository data, "
-                    "and update your score estimate ONLY if new evidence from "
-                    "the repository data warrants it. "
-                    "Do NOT copy or mirror another agent's score — anchor yours "
-                    "to the specific evidence you cite. "
-                    "Do NOT invent any data. "
-                    "State your current score estimate as a plain number at the "
-                    "very end of your message, e.g. 'My current estimate: 6/10'."
-                )
-
-            # Identity is locked in the system prompt so the model cannot confuse roles
-            system = (
-                f"You are the {agent.display_name} in a structured evaluation panel.\n\n"
-                + agent.system_prompt
-            )
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": agent_user_content},
-            ]
-            reply = call_llm(messages, model=model, llm_host=llm_host, max_tokens=800)
-            debate_log.append({"role": agent.name, "content": reply})
-
-    # ── Synthesizer: receives full transcript, produces final JSON ────────
-    transcript = _format_transcript(debate_log)
-
-    # Compute the median of all scores stated in the transcript in Python so
-    # the LLM has an explicit anchor and cannot drift to 0 or 10.
     median_score = _compute_transcript_median(debate_log, metric.scale)
     median_hint = (
         f"The median of all numeric score estimates in the transcript is "
@@ -361,121 +427,133 @@ def _run_debate(
             ),
         },
     ]
-    synth_reply = call_llm(synth_messages, model=model, llm_host=llm_host, max_tokens=600)
-    debate_log.append({"role": "synthesizer", "content": synth_reply})
+    synth_reply = call_llm(
+        synth_messages,
+        model=state["llm_model"],
+        llm_host=state["llm_host"],
+        max_tokens=600,
+    )
+    final_log = debate_log + [{"role": "synthesizer", "content": synth_reply}]
 
-    # If the LLM still produced a bad score, fall back to the Python-computed median
     parsed = _parse_json_response(synth_reply)
     if parsed.get("metric") is None and median_score is not None:
         parsed["metric"] = median_score
         parsed.setdefault("explanation", synth_reply)
 
-    # Hard clamp: ensure the final score is always within the declared scale,
-    # regardless of what the LLM returned.  This prevents values like -1 or 11
-    # from slipping through the JSON parser's numeric fallback.
     lo, hi = metric.scale
     raw_metric = parsed.get("metric")
     if raw_metric is not None:
         parsed["metric"] = max(lo, min(hi, float(raw_metric)))
 
-    return MetricResult(
+    result = MetricResult(
         name=metric.name,
         display_name=metric.display_name,
         metric=parsed.get("metric"),
         explanation=parsed.get("explanation", ""),
         pipeline="debate",
-        debate_log=debate_log,
+        debate_log=final_log,
     )
 
-
-def _save_debate_log(
-    debate_log: list[dict[str, str]],
-    metric: MetricDefinition,
-    result: "MetricResult",
-    repo_slug: str,
-    snapshot_timestamp: float | None,
-    log_dir: str,
-) -> str:
-    """Write *debate_log* to a JSON file and return the path.
-
-    Filename pattern: ``{metric}_{repo_slug_safe}_{timestamp}.json``
-    """
-    os.makedirs(log_dir, exist_ok=True)
-
-    ts = int(snapshot_timestamp) if snapshot_timestamp is not None else int(
-        datetime.now(timezone.utc).timestamp()
+    log_path = _save_debate_log(
+        final_log,
+        metric,
+        result,
+        state.get("repo_slug", "unknown_repo"),
+        state.get("snapshot_timestamp"),
+        state.get("log_dir", "debate_logs"),
     )
-    slug_safe = repo_slug.replace("/", "_")
-    filename = f"{metric.name}_{slug_safe}_{ts}.json"
-    path = os.path.join(log_dir, filename)
+    print(f"  💾  Debate log saved: {log_path}")
 
-    median_score = _compute_transcript_median(debate_log, metric.scale)
-    payload = {
-        "metric": metric.name,
-        "display_name": metric.display_name,
-        "repo": repo_slug,
-        "snapshot_timestamp": snapshot_timestamp,
-        "agents": [a.name for a in metric.get_debate_agents()],
-        "debate_rounds": metric.debate_rounds,
-        "final_score": result.get("metric"),
-        "transcript_median": median_score,
-        "log": debate_log,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    return path
+    return {"debate_log": final_log, "result": result}
+
+
+def _should_synthesize(state: DebateState) -> Literal["agent_turn", "synthesize"]:
+    """Conditional edge: keep looping until all rounds are exhausted."""
+    if state.get("current_round", 0) >= state["metric"].debate_rounds:
+        return "synthesize"
+    return "agent_turn"
+
+
+def _build_debate_graph() -> Any:
+    g = StateGraph(DebateState)
+    g.add_node("agent_turn", _agent_turn_node)
+    g.add_node("synthesize", _synthesize_node)
+    g.add_edge(START, "agent_turn")
+    g.add_conditional_edges("agent_turn", _should_synthesize)
+    g.add_edge("synthesize", END)
+    return g.compile()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# LangGraph wiring
+# Top-level graph — fan-out via Send, accumulate via reducer
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _evaluate_metrics_node(state: PipelineState) -> dict:
-    """Evaluate all requested metrics (sequentially for Ollama)."""
-    repo_data = state["repo_data"]
+_single_graph = _build_single_graph()
+_debate_graph = _build_debate_graph()
+
+
+def _fan_out(state: PipelineState) -> list[Send]:
+    """Return one Send per metric — used as a conditional-edges function off START."""
     metrics = state.get("metrics", DEFAULT_METRICS)
-    model = state.get("llm_model", "gemma3:27b")
-    llm_host = state.get("llm_host", "http://localhost:11434")
-    repo_slug = state.get("repo_slug", "unknown_repo")
-    snapshot_timestamp = state.get("snapshot_timestamp")
-    log_dir = state.get("log_dir", "debate_logs")
-
-    results: list[MetricResult] = []
+    sends = []
     for metric in metrics:
         agents_desc = ""
         if metric.pipeline == "debate":
             agent_list = metric.get_debate_agents()
             agents_desc = f" — agents: {[a.name for a in agent_list]}"
-        print(f"  ⏳  Evaluating: {metric.display_name} ({metric.pipeline}{agents_desc}) …")
+        print(f"  ⏳  Queuing: {metric.display_name} ({metric.pipeline}{agents_desc})")
+
+        scoped: dict[str, Any] = {
+            "metric": metric,
+            "repo_data": state["repo_data"],
+            "llm_model": state.get("llm_model", "gemma3:27b"),
+            "llm_host": state.get("llm_host", "http://localhost:11434"),
+            "repo_slug": state.get("repo_slug", "unknown_repo"),
+            "snapshot_timestamp": state.get("snapshot_timestamp"),
+            "log_dir": state.get("log_dir", "debate_logs"),
+        }
         if metric.pipeline == "debate":
-            result = _run_debate(metric, repo_data, model, llm_host)
-            log_path = _save_debate_log(
-                result["debate_log"], metric, result, repo_slug, snapshot_timestamp, log_dir
-            )
-            print(f"  💾  Debate log saved: {log_path}")
+            scoped.update({"debate_log": [], "current_round": 0, "current_agent_idx": 0})
+            sends.append(Send("run_debate", scoped))
         else:
-            result = _run_single(metric, repo_data, model, llm_host)
-        results.append(result)
-        score = result.get("metric", "?")
-        print(f"  ✅  {metric.display_name}: {score}")
-
-    return {"results": results}
+            sends.append(Send("run_single", scoped))
+    return sends
 
 
-def build_graph() -> StateGraph:
-    """Construct and compile the LangGraph pipeline."""
+def _run_single_wrapper(state: SingleMetricState) -> dict:
+    """Invoke the single sub-graph and surface the result into top-level state."""
+    final = _single_graph.invoke(state)
+    result: MetricResult = final["result"]
+    print(f"  ✅  {result['display_name']}: {result.get('metric', '?')}")
+    return {"results": [result]}
+
+
+def _run_debate_wrapper(state: DebateState) -> dict:
+    """Invoke the debate sub-graph and surface the result into top-level state."""
+    final = _debate_graph.invoke(state)
+    result: MetricResult = final["result"]
+    print(f"  ✅  {result['display_name']}: {result.get('metric', '?')}")
+    return {"results": [result]}
+
+
+def build_graph() -> Any:
+    """Construct and compile the top-level LangGraph pipeline."""
     graph = StateGraph(PipelineState)
 
-    graph.add_node("evaluate_metrics", _evaluate_metrics_node)
+    graph.add_node("run_single", _run_single_wrapper)
+    graph.add_node("run_debate", _run_debate_wrapper)
 
-    graph.set_entry_point("evaluate_metrics")
-    graph.add_edge("evaluate_metrics", END)
+    # _fan_out is a conditional-edges function: it returns Send objects that
+    # route each metric to run_single or run_debate without going through a node.
+    graph.add_conditional_edges(START, _fan_out, ["run_single", "run_debate"])
+    graph.add_edge("run_single", END)
+    graph.add_edge("run_debate", END)
 
     return graph.compile()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Public API
+# Public API (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def analyse_repo(
