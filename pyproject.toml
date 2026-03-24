@@ -1,0 +1,26 @@
+[project]
+name = "llm-metrics"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "tkietreiber", email = "tobias.kietreiber@fhstp.ac.at"},
+]
+dependencies = [
+    "langgraph",
+    "requests",
+]
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+
+
+[tool.pdm]
+distribution = false
+
+[[tool.pdm.source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[dependency-groups]
+dev = []
