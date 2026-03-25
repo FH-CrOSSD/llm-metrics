@@ -24,6 +24,7 @@ def call_llm(
     *,
     model: str = DEFAULT_MODEL,
     llm_host: str = DEFAULT_LLM_HOST,
+    llm_auth_token: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 2048,
 ) -> str:
@@ -39,6 +40,7 @@ def call_llm(
         llm_host.rstrip("/") + "/api/chat",
         json=payload,
         timeout=300,
+        headers={"Authorization": f"Bearer {llm_auth_token}"} if llm_auth_token else None,
     )
     resp.raise_for_status()
     data = resp.json()

@@ -1,5 +1,5 @@
 [project]
-name = "llm-metrics"
+name = "llm_metrics"
 version = "0.1.0"
 description = "Default template for PDM package"
 authors = [
@@ -22,5 +22,8 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 name = "pypi"
 
-[dependency-groups]
-dev = []
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "-e file:///${PROJECT_ROOT}/#egg=llm-metrics",
+]

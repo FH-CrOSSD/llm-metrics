@@ -27,8 +27,8 @@ import sys
 
 import requests
 
-from config import DEFAULT_METRICS, MetricDefinition
-from graph import analyse_repo
+from llm_metrics.config import DEFAULT_METRICS, MetricDefinition
+from llm_metrics.graph import analyse_repo
 
 
 def fetch_snapshots(repo_slug: str, crossd_host: str) -> list[float]:
@@ -153,6 +153,10 @@ def main() -> None:
         help="Ollama API base URL.",
     )
     parser.add_argument(
+        "--llm-auth-token",
+        help="Authentication token for the Ollama API.",
+    )
+    parser.add_argument(
         "--crossd-host",
         default="https://health.crossd.tech/api",
         help="CrOSSD API base URL.",
@@ -213,6 +217,7 @@ def main() -> None:
         metrics,
         model=args.model,
         llm_host=args.llm_host,
+        llm_auth_token=args.llm_auth_token,
         repo_slug=repo_slug,
         snapshot_timestamp=snapshot_timestamp,
         log_dir=args.log_dir,
@@ -220,7 +225,9 @@ def main() -> None:
 
     # ── Output ───────────────────────────────────────────────────────────
     if args.json:
-        print(json.dumps(results, indent=2, default=str))
+        res = {elem["name"]: elem for elem in results}
+        print(json.dumps(res, indent=2, default=str))
+        # print(json.dumps(results, indent=2, default=str))
     else:
         print_report(results)
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from config import MetricDefinition
+from llm_metrics.config import MetricDefinition
 
 # ── Section mapping ─────────────────────────────────────────────────────────
 # Maps logical data_key names (used in MetricDefinition.data_keys) to

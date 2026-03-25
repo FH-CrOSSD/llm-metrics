@@ -65,7 +65,7 @@ requests>=2.31
 Install with:
 
 ```bash
-pip install langgraph requests
+pdm install --dev
 ```
 
 ---
@@ -74,25 +74,25 @@ pip install langgraph requests
 
 ```bash
 # Analyse a repo from the CrOSSD API (newest snapshot)
-python main.py lorabridge/lorabridge
+pdm run src/llm_metrics/main.py lorabridge/lorabridge
 
 # Use a specific crawl-snapshot timestamp
-python main.py lorabridge/lorabridge --timestamp 1758139805.6506386
+pdm run src/llm_metrics/main.py lorabridge/lorabridge --timestamp 1758139805.6506386
 
 # Analyse from a local JSON export
-python main.py --file example.json
+pdm run src/llm_metrics/main.py --file example.json
 
 # Run only specific metrics
-python main.py google/flax --metrics friendliness documentation_quality
+pdm run src/llm_metrics/main.py google/flax --metrics friendliness documentation_quality
 
 # Use a different Ollama model or host
-python main.py google/flax --model llama3.1:8b --llm-host http://localhost:11434
+pdm run src/llm_metrics/main.py google/flax --model llama3.1:8b --llm-host http://localhost:11434
 
 # Output raw JSON instead of a formatted report
-python main.py google/flax --json
+pdm run src/llm_metrics/main.py google/flax --json
 
 # Save debate logs to a custom directory
-python main.py google/flax --log-dir my_logs/
+pdm run src/llm_metrics/main.py google/flax --log-dir my_logs/
 ```
 
 ---
@@ -164,6 +164,7 @@ DEFAULT_METRICS.append(
 ## Project structure
 
 ```
+src/llm_metrics/
 ├── main.py          # CLI entry-point
 ├── config.py        # Metric definitions and debate agent presets
 ├── graph.py         # LangGraph pipeline (single & debate sub-graphs)

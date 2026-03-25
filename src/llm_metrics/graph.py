@@ -35,12 +35,12 @@ from typing import Annotated, Any, Literal, TypedDict
 from langgraph.constants import Send
 from langgraph.graph import END, START, StateGraph
 
-from agents import (
+from llm_metrics.agents import (
     SINGLE_AGENT_SYSTEM,
     call_llm,
 )
-from config import DEFAULT_METRICS, DebateAgent, MetricDefinition
-from rag import build_repo_summary, retrieve_context
+from llm_metrics.config import DEFAULT_METRICS, DebateAgent, MetricDefinition
+from llm_metrics.rag import build_repo_summary, retrieve_context
 
 # ═══════════════════════════════════════════════════════════════════════════
 # State definitions
@@ -68,6 +68,7 @@ class PipelineState(TypedDict, total=False):
     results: Annotated[list[MetricResult], _merge_results]
     llm_model: str
     llm_host: str
+    llm_auth_token: str | None
     # Provenance – used to name saved debate logs
     repo_slug: str          # e.g. "lorabridge/lorabridge"
     snapshot_timestamp: float | None  # crawl timestamp, or None for local files
@@ -82,6 +83,7 @@ class SingleMetricState(TypedDict, total=False):
     repo_data: dict[str, Any]
     llm_model: str
     llm_host: str
+    llm_auth_token: str | None
     repo_slug: str
     snapshot_timestamp: float | None
     log_dir: str
@@ -96,6 +98,7 @@ class DebateState(TypedDict, total=False):
     repo_data: dict[str, Any]
     llm_model: str
     llm_host: str
+    llm_auth_token: str | None
     repo_slug: str
     snapshot_timestamp: float | None
     log_dir: str
@@ -292,7 +295,7 @@ def _single_node(state: SingleMetricState) -> dict:
         {"role": "system", "content": SINGLE_AGENT_SYSTEM},
         {"role": "user", "content": user_msg},
     ]
-    reply = call_llm(messages, model=state["llm_model"], llm_host=state["llm_host"])
+    reply = call_llm(messages, model=state["llm_model"], llm_host=state["llm_host"], llm_auth_token=state.get("llm_auth_token"))
     parsed = _parse_json_response(reply)
     return {
         "result": MetricResult(
@@ -369,6 +372,7 @@ def _agent_turn_node(state: DebateState) -> dict:
         messages,
         model=state["llm_model"],
         llm_host=state["llm_host"],
+        llm_auth_token=state.get("llm_auth_token"),
         max_tokens=800,
     )
 
@@ -431,6 +435,7 @@ def _synthesize_node(state: DebateState) -> dict:
         synth_messages,
         model=state["llm_model"],
         llm_host=state["llm_host"],
+        llm_auth_token=state.get("llm_auth_token"),
         max_tokens=600,
     )
     final_log = debate_log + [{"role": "synthesizer", "content": synth_reply}]
@@ -508,6 +513,7 @@ def _fan_out(state: PipelineState) -> list[Send]:
             "repo_data": state["repo_data"],
             "llm_model": state.get("llm_model", "gemma3:27b"),
             "llm_host": state.get("llm_host", "http://localhost:11434"),
+            "llm_auth_token": state.get("llm_auth_token", None),
             "repo_slug": state.get("repo_slug", "unknown_repo"),
             "snapshot_timestamp": state.get("snapshot_timestamp"),
             "log_dir": state.get("log_dir", "debate_logs"),
@@ -562,6 +568,7 @@ def analyse_repo(
     *,
     model: str = "gemma3:27b",
     llm_host: str = "http://localhost:11434",
+    llm_auth_token: str | None = None,
     repo_slug: str = "unknown_repo",
     snapshot_timestamp: float | None = None,
     log_dir: str = "debate_logs",
@@ -573,6 +580,7 @@ def analyse_repo(
         "metrics": metrics or DEFAULT_METRICS,
         "llm_model": model,
         "llm_host": llm_host,
+        "llm_auth_token": llm_auth_token,
         "repo_slug": repo_slug,
         "snapshot_timestamp": snapshot_timestamp,
         "log_dir": log_dir,
