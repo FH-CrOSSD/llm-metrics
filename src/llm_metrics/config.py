@@ -52,7 +52,7 @@ _DEBATE_RULES = (
     "3. Keep your score estimate within the stated scale and anchor it to the "
     "evidence you cite. Do NOT lower (or raise) your score because another "
     "participant did — only revise your estimate when new repository data "
-    "justifies it. Scores of 0 or 10 require extraordinary data-backed reasons; "
+    "justifies it. Scores of 0 (or minimum) or 10 (or maximum) require extraordinary data-backed reasons; "
     "never assign them just because someone else did.\n"
     "4. Write only in YOUR OWN voice. Do NOT write role headers such as "
     "'Response from the Analyst', 'Round N Response – Security Auditor', etc., "

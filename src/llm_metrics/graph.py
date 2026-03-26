@@ -140,8 +140,8 @@ def _parse_json_response(text: str) -> dict[str, Any]:
             pass
     score_match = re.search(
         r"(?:score|rating|metric|give(?:\s+this)?(?:\s+a)?|rank)\D{0,10}(\d+(?:\.\d+)?)"
-        r"|(\d+(?:\.\d+)?)\s*/\s*10"
-        r"|\b(\d+(?:\.\d+)?)\s+out\s+of\s+10",
+        r"|(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)"
+        r"|\b(\d+(?:\.\d+)?)\s+out\s+of\s+(\d+(?:\.\d+)?)",
         text,
         re.IGNORECASE,
     )
@@ -178,7 +178,7 @@ def _extract_stated_score(text: str) -> float | None:
     matches = re.findall(
         r"(?:current estimate|my estimate|i.{0,8}give|i.{0,8}rate|i.{0,8}score|score|rating|estimate)"
         r"[^\d]{0,15}(\d+(?:\.\d+)?)"
-        r"|(\d+(?:\.\d+)?)\s*/\s*10",
+        r"|(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",
         text,
         re.IGNORECASE,
     )
