@@ -1,9 +1,10 @@
 [project]
 name = "llm_metrics"
-version = "0.3.0"
+version = "0.4.0"
 description = "Default template for PDM package"
 authors = [
     {name = "tkietreiber", email = "tobias.kietreiber@fhstp.ac.at"},
+    {name = "tobiasdam", email = "198982749+Copilot@users.noreply.github.com"},
 ]
 dependencies = [
     "langgraph",
