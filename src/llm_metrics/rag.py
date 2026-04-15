@@ -168,7 +168,7 @@ def _compact_json(obj: Any, max_depth: int = 6, _depth: int = 0) -> Any:
             return f"[...{len(obj)} items]"
         return obj
     if isinstance(obj, dict):
-        return {k: _compact_json(v, max_depth, _depth + 1) for k, v in obj.items()}
+        return {k: _compact_json(v, max_depth, _depth + 1) for k, v in obj.items() if k not in ("pageInfo", "cursor", "id")}
     if isinstance(obj, list):
         # For very long lists keep only first + last to save tokens
         if len(obj) > 6:
