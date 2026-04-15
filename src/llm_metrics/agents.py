@@ -36,15 +36,27 @@ def call_llm(
         "max_tokens": max_tokens,
         "stream": False,
     }
+    # print(len(json.dumps(payload)))
+    # exit()
     resp = requests.post(
-        llm_host.rstrip("/") + "/api/chat",
+        llm_host.rstrip("/") + ("/api/chat/completions" if model.startswith("vLLM.") else "/api/chat"),
         json=payload,
-        timeout=300,
+        timeout=3000,
         headers={"Authorization": f"Bearer {llm_auth_token}"} if llm_auth_token else None,
     )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print("Status code:", e.response.status_code)
+        print("Headers:", e.response.headers)
+        print("Raw text:", e.response.text)
+        raise e
+    # print(resp.text)
     data = resp.json()
-    return data.get("message", {}).get("content", "")
+    if model.startswith("vLLM."):
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    else:
+        return data.get("message", {}).get("content", "")
 
 
 # ── Prompt templates ────────────────────────────────────────────────────
