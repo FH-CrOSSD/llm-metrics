@@ -25,6 +25,9 @@ import argparse
 import json
 import sys
 
+from dateutil.relativedelta import relativedelta
+import datetime
+from typing import Callable
 import requests
 
 from llm_metrics.config import DEFAULT_METRICS, MetricDefinition
@@ -124,6 +127,36 @@ def print_report(results: list[dict]) -> None:
     print("\n" + "=" * 70)
 
 
+def date_filter(
+    data: list[dict],
+    selector: Callable[[dict], str],
+    since: datetime.datetime | relativedelta,
+) -> list[dict]:
+    """
+    Filter a list of dictionaries based on a date.
+
+    Args:
+        data: list[dict]: The list of dictionaries to be filtered.
+        selector: Callable: A function that takes a dictionary and returns a date ISO8601 string.
+        since: datetime.datetime | datetime.timedelta: The date or time duration to filter the data. (Default value = datetime.timedelta(days=30 * 6))
+    Returns:
+        list[dict]: A list of dictionaries that match the date filter.
+    """
+    if type(since) == datetime.datetime:
+        # if since is a datetime object, use it as is
+        past = since
+    elif type(since) == relativedelta:
+        # if since is a timedelta object, use it to calculate the past date
+        past = datetime.datetime.now(datetime.UTC) - since
+    else:
+        raise TypeError("since not of type datetime.datetime, dateutil.relativedelta.relativedelta")
+
+    res = []
+    for elem in data:
+        if datetime.datetime.fromisoformat(selector(elem)) > past:
+            res.append(elem)
+    return res
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Analyse GitHub repository health using LLM agents."
@@ -211,9 +244,36 @@ def main() -> None:
     metrics = select_metrics(args.metrics)
     print(f"📊 Evaluating {len(metrics)} metric(s): {[m.name for m in metrics]}\n")
 
+    issues_data = date_filter(
+        repo_data["repository"]["repository"]["issues"]["edges"],
+        lambda x: x["node"]["updatedAt"],
+        # datetime.timedelta(days=30 * 3),
+        relativedelta(weeks=12),
+    )
+    # print(issues_data)
+    print(f"   ℹ️  {len(issues_data)} issues updated in the last week.")
+    # exit()
+    # print(f"   ℹ️  {len(repo_data['repository']['repository']['issues']['edges'])} total issues.")
+    numbers = tuple("issue"+str(x['node']['number']) for x in issues_data)
+    repo_data['repository']['repository']['issues']['edges'] = issues_data
+    for key in list(repo_data['repository']['repository'].keys()):
+        if key != "issues" and key.startswith("issue") and key not in numbers:
+            del repo_data['repository']['repository'][key]
+    repo_data["repository"]["organizations"] = [{"login":repo_data["repository"]["organizations"][u]["login"],"organizations":repo_data["repository"]["organizations"][u]["organizations"]["nodes"]} for u in repo_data["repository"]["organizations"] if "login" in repo_data["repository"]["organizations"][u]]
+
+    repo_data["repository"]["repository"]["releases"]["edges"] = [e["node"] for e in repo_data["repository"]["repository"]["releases"]["edges"]]
+
+    repo_data["repository"]["repository"]["branches"]["edges"] = [e["branch"] for e in repo_data["repository"]["repository"]["branches"]["edges"]]
+
+    repo_data["repository"]["repository"]["pullRequests"]["edges"] = [e["node"] for e in repo_data["repository"]["repository"]["pullRequests"]["edges"]]
+
+    repo_data["repository"]["repository"]["issues"]["edges"] = [e["node"] for e in repo_data["repository"]["repository"]["issues"]["edges"]]
+
+
     # ── Run pipeline ─────────────────────────────────────────────────────
     results = analyse_repo(
         repo_data,
+        # [DEFAULT_METRICS[3]],
         metrics,
         model=args.model,
         llm_host=args.llm_host,
